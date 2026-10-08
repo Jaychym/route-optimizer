@@ -1,0 +1,12 @@
+{
+  "ucg_exporter": "192.168.10.1",
+  "bgp_peer": "192.168.10.1",
+  "own_ips": ["192.168.10.50", "10.250.1.2", "10.250.2.2"],
+  "internal_networks": ["192.168.10.0/24", "192.168.20.0/24"],
+  "wan_connected_networks": ["198.51.100.0/24", "203.0.113.0/24"],
+  "extra_blocked_networks": [],
+  "isps": {
+    "FRONTIER": {"source": "10.250.1.2", "next_hop": "198.51.100.1"},
+    "SPECTRUM": {"source": "10.250.2.2", "next_hop": "203.0.113.1"}
+  }
+}
