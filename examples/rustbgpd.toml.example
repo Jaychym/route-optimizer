@@ -1,12 +1,16 @@
 # rustbgpd template for one iBGP peer (UniFi UCG).
 # Documentation IPs only; replace ALL local/neighbor addresses before use.
+# Explicit RFC 8212 secure defaults allow rustbgpd --check --strict to pass.
 # Keep the API on the default owner-only local Unix socket.
 # Check with: rustbgpd --check --strict /etc/rustbgpd/config.toml
 # Ensure rustbgpd can bind TCP/179 (systemd service or CAP_NET_BIND_SERVICE).
 # Do not configure [[fib_tables]]: the UniFi gateway performs forwarding.
 
+config_epoch = 2
+
 [global]
 asn = 65050
+ebgp_requires_policy = true
 router_id = "192.0.2.50"
 listen_port = 179
 listen_addresses = ["192.0.2.50"]
