@@ -10,6 +10,9 @@ Pin a tested rustbgpd release instead of tracking `main` for unattended use.
 
 - **Unchanged:** IPFIX/nfdump, probes, prefix scoring, 3-win/quiet/hold-down
   safety policy, read-only dashboard, UniFi inbound BGP prefix filters.
+- **Private ISP labels:** optionally set `isp_labels` in the local JSON config
+  to customize dashboard and console names. Do not rename the `isps` keys
+  (`ISPA`/`ISPB`), which remain stable routing and state identifiers.
 - **Changed:** BGP peer is served by rustbgpd; `rbgp rib add` / `rib delete`
   perform route changes through a local Unix gRPC socket.
 - **State ownership:** v3.3 state with installed routes implicitly belongs to

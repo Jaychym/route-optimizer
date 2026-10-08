@@ -197,6 +197,32 @@ class MonitoringTests(unittest.TestCase):
         path = ROOT.parent / "examples" / "config.example.json"
         engine.configure_site(json.loads(path.read_text(encoding="utf-8")))
         self.assertEqual(set(engine.ISPS), {"ISPA", "ISPB"})
+        self.assertEqual(engine.ISP_LABELS, {"ISPA": "Primary WAN", "ISPB": "Secondary WAN"})
+
+    def test_private_isp_display_labels_do_not_change_route_identifiers(self):
+        # Names are configured privately; public code and route-state keys
+        # intentionally retain the stable ISPA/ISPB identifiers.
+        config = json.loads((ROOT.parent / "examples" / "config.example.json").read_text())
+        config["isp_labels"] = {"ISPA": "Provider One", "ISPB": "Provider Two"}
+        engine.configure_site(config)
+        self.assertEqual(set(engine.ISPS), {"ISPA", "ISPB"})
+        self.assertEqual(engine.display_isp("MOVE ISPA -> ISPB"), "MOVE Provider One -> Provider Two")
+        self.assertEqual(engine.ISPS["ISPA"]["source"], "10.250.1.2")
+
+    def test_private_isp_display_labels_validate_bad_config(self):
+        config = json.loads((ROOT.parent / "examples" / "config.example.json").read_text())
+        for labels in ({"ISPC": "Other"}, ["Not a map"],
+                       {"ISPA": "Same", "ISPB": "same"},
+                       {"ISPA": "Bad\nLabel"}, {"ISPB": ""}):
+            config["isp_labels"] = labels
+            with self.subTest(labels=labels), self.assertRaises(ValueError):
+                engine.configure_site(config)
+
+    def test_dashboard_supports_dynamic_isp_labels_without_embedded_names(self):
+        self.assertIn('data-isp-label="ISPA"', web.HTML)
+        self.assertIn('data-isp-label="ISPB"', web.HTML)
+        self.assertIn('snapshot?.isp_labels', web.HTML)
+        self.assertIn('showIsp(r.observed', web.HTML)
 
     def test_http_get_and_no_route_write_api(self):
         status = {'epoch': 1, 'rows': [], 'mode': 'DRY-RUN'}

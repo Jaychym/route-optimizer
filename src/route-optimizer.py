@@ -56,6 +56,15 @@ BASE_BLOCKED_NETWORKS = tuple(map(ipaddress.ip_network, [
 BLOCKED_NETWORKS = BASE_BLOCKED_NETWORKS
 ISPS = {}
 ISP_BY_NEXTHOP = {}
+ISP_LABELS = {"ISPA": "ISPA", "ISPB": "ISPB"}
+
+
+def display_isp(value):
+    """Format opaque ISP identifiers for operator-facing text only.
+
+    Stored route state, IPFIX measurements and command keys remain ISPA/ISPB.
+    """
+    return re.sub(r"\bISPA\b|\bISPB\b", lambda m: ISP_LABELS[m.group()], str(value))
 
 
 def configure_site(cfg):
@@ -65,7 +74,7 @@ def configure_site(cfg):
     networks. Examples use documentation addresses and are not real routes.
     """
     global UCG_EXPORTER, BGP_PEER, OWN_IPS, INTERNAL_NETWORKS
-    global BLOCKED_NETWORKS, ISPS, ISP_BY_NEXTHOP
+    global BLOCKED_NETWORKS, ISPS, ISP_BY_NEXTHOP, ISP_LABELS
     if not isinstance(cfg, dict):
         raise ValueError("site config must be a JSON object")
     def v4(value):
@@ -89,6 +98,19 @@ def configure_site(cfg):
     declared = cfg["isps"]
     if set(declared) != expected:
         raise ValueError("isps must have ISPA and ISPB keys")
+    raw_labels = cfg.get("isp_labels", {})
+    if not isinstance(raw_labels, dict) or not set(raw_labels) <= expected:
+        raise ValueError("isp_labels must be an object containing only ISPA/ISPB keys")
+    labels = {}
+    for name in ("ISPA", "ISPB"):
+        label = raw_labels.get(name, name)
+        if (not isinstance(label, str) or not 1 <= len(label) <= 24
+                or label != label.strip()
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in label)):
+            raise ValueError(f"isp_labels.{name} must be a printable 1–24 character name")
+        labels[name] = label
+    if labels["ISPA"].casefold() == labels["ISPB"].casefold():
+        raise ValueError("ISP display names must be different")
     providers = {}
     for name in ("ISPA", "ISPB"):
         item = declared[name]
@@ -109,6 +131,7 @@ def configure_site(cfg):
         net(x) for x in cfg.get("extra_blocked_networks", []))
     ISPS = providers
     ISP_BY_NEXTHOP = {v["next_hop"]: k for k, v in ISPS.items()}
+    ISP_LABELS = labels
 
 
 PREFIX_LENGTH = 24
@@ -908,7 +931,8 @@ def cycle(state, args):
     print(f"Prefix /{PREFIX_LENGTH} | top {args.top} | win {WIN_STREAK_REQUIRED} | "
           f"quiet {QUIET_SECONDS}s | hold {HOLD_DOWN}s | "
           f"routes {len(state['routes'])}/{args.max_routes}")
-    print(f"{'Prefix':<19} {'MiB':>8} {'Hosts':>5} {'Observed':<9} {'Route':<9} {'ISPA':>20} {'ISPB':>20}  Action")
+    print(f"{'Prefix':<19} {'MiB':>8} {'Hosts':>5} {'Observed':<9} {'Route':<9} "
+          f"{ISP_LABELS['ISPA']:>20} {ISP_LABELS['ISPB']:>20}  Action")
     print("-" * 149)
     handled = set()
     dashboard_rows = []
@@ -929,9 +953,9 @@ def cycle(state, args):
                 action = f"{'WITHDRAW' if args.apply else 'WOULD WITHDRAW'} inactive" if ok else f"WITHDRAW FAILED: {msg}"
         installed = state["routes"].get(prefix, {}).get("isp", "-")
         print(f"{prefix:<19} {row['bytes']/1048576:8.2f} {len(row['hosts']):5d} "
-              f"{str(row['current'] or '-'):9.9} {installed:9.9} "
+              f"{display_isp(row['current'] or '-'):9.9} {display_isp(installed):9.9} "
               f"{fmt_probe(measurements.get('ISPA') if measurements else None):>20} "
-              f"{fmt_probe(measurements.get('ISPB') if measurements else None):>20}  {action}", flush=True)
+              f"{fmt_probe(measurements.get('ISPB') if measurements else None):>20}  {display_isp(action)}", flush=True)
         dashboard_rows.append({
             "prefix": prefix, "mib": round(row["bytes"] / 1048576, 3),
             "hosts": len(row["hosts"]), "representatives": [h["ip"] for h in row["hosts"]],
@@ -942,7 +966,7 @@ def cycle(state, args):
         })
     sweep_messages = expiry_sweep(state, records, handled, args.apply)
     for msg in sweep_messages:
-        print(msg, flush=True)
+        print(display_isp(msg), flush=True)
     for prefix, ds in list(state["destinations"].items()):
         if prefix not in state["routes"] and not ds.get("pending") and ts() - float(ds.get("updated", 0)) > STATE_GC:
             del state["destinations"][prefix]
@@ -961,6 +985,7 @@ def cycle(state, args):
         print(f"WARNING quality history write failed: {exc}", file=sys.stderr)
     snapshot = {
         "version": "3.4", "epoch": cycle_epoch,
+        "isp_labels": ISP_LABELS.copy(),
         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         "mode": "APPLY" if args.apply else "DRY-RUN", "error": None,
         "cycle_seconds": round(time.monotonic() - started, 2),
@@ -1061,6 +1086,7 @@ def main():
             try:
                 write_status({
                     "version": "3.4", "epoch": ts(),
+                    "isp_labels": ISP_LABELS.copy(),
                     "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
                     "mode": "APPLY" if args.apply else "DRY-RUN", "error": str(exc),
                     "cycle_seconds": None,
