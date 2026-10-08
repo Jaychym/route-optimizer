@@ -1,0 +1,23 @@
+# Example Debian ifupdown stanzas (adapt NICs/VLAN tagging to your VM).
+# LAN mgmt and BGP peer address
+allow-hotplug ens18
+iface ens18 inet static
+    address 192.168.10.50/24
+    gateway 192.168.10.1
+
+# Provider A probe source; configure the UCG to policy route this subnet
+# out WAN A. The UCG address on this probe VLAN is 10.250.1.1.
+allow-hotplug ens19
+iface ens19 inet static
+    address 10.250.1.2/30
+    post-up ip route replace default via 10.250.1.1 dev ens19 table 251
+    post-up ip rule add from 10.250.1.2/32 table 251 priority 1251 || true
+    pre-down ip rule del from 10.250.1.2/32 table 251 priority 1251 || true
+
+# Provider B probe source; UCG VLAN gateway is 10.250.2.1.
+allow-hotplug ens20
+iface ens20 inet static
+    address 10.250.2.2/30
+    post-up ip route replace default via 10.250.2.1 dev ens20 table 252
+    post-up ip rule add from 10.250.2.2/32 table 252 priority 1252 || true
+    pre-down ip rule del from 10.250.2.2/32 table 252 priority 1252 || true
