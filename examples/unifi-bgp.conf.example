@@ -1,0 +1,60 @@
+! UniFi Route Optimizer - FRR BGP import example
+!
+! Upload this as the gateway's BGP/FRR configuration file using the
+! appropriate UniFi configuration import option on supported firmware.
+! IMPORTANT: If an import REPLACES the complete FRR configuration, merge
+! this BGP configuration with existing OSPF/other routing sections first.
+!
+! CUSTOMIZE BEFORE UPLOAD:
+!  65050         both sides' private ASN
+!  192.0.2.1     gateway BGP router ID (EXAMPLE ONLY)
+!  192.0.2.10    optimizer management/peer IP (EXAMPLE ONLY)
+!  Uncomment and replace the WAN-connected-prefix deny statements below.
+!  Set maximum-prefix greater than the optimizer's max-routes.
+!  These example IPs are documentation addresses and will NOT work unchanged.
+!
+router bgp 65050
+ bgp router-id 192.0.2.1
+ neighbor 192.0.2.10 remote-as 65050
+ neighbor 192.0.2.10 description ROUTE-OPTIMIZER
+ !
+ address-family ipv4 unicast
+  neighbor 192.0.2.10 activate
+  neighbor 192.0.2.10 soft-reconfiguration inbound
+  neighbor 192.0.2.10 maximum-prefix 75
+  neighbor 192.0.2.10 route-map ROUTE_OPTIMIZER_IN in
+ exit-address-family
+exit
+!
+! Deny special-use source/destination ranges from optimizer injection.
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 2 deny 0.0.0.0/8 le 32
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 5 deny 10.0.0.0/8 le 32
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 10 deny 100.64.0.0/10 le 32
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 15 deny 127.0.0.0/8 le 32
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 20 deny 169.254.0.0/16 le 32
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 25 deny 172.16.0.0/12 le 32
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 30 deny 192.168.0.0/16 le 32
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 31 deny 192.0.0.0/24 le 32
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 32 deny 192.0.2.0/24 le 32
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 33 deny 198.18.0.0/15 le 32
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 34 deny 198.51.100.0/24 le 32
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 35 deny 203.0.113.0/24 le 32
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 40 deny 224.0.0.0/4 le 32
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 41 deny 240.0.0.0/4 le 32
+!
+! REQUIRED: Deny your actual WAN-connected subnets. Replace the
+! placeholders with actual prefixes and remove the leading '!'.
+! ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 50 deny <WAN_A_CONNECTED_CIDR> le 32
+! ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 51 deny <WAN_B_CONNECTED_CIDR> le 32
+! Add any additional site-specific connected/public infrastructure prefixes
+! and other excluded routes before the seq 100 permit.
+!
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 100 permit 0.0.0.0/0 ge 24 le 32
+!
+route-map ROUTE_OPTIMIZER_IN permit 10
+ match ip address prefix-list ROUTE_OPTIMIZER_ALLOWED
+exit
+!
+route-map ROUTE_OPTIMIZER_IN deny 100
+exit
+!
