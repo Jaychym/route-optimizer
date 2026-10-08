@@ -1,0 +1,26 @@
+# Opt-in systemd unit for the optimizer with rustbgpd on the SAME host.
+# Do not install over the working ExaBGP service before the migration steps.
+[Unit]
+Description=Route Optimizer v3.4 - rustbgpd backend (DRY-RUN)
+Wants=network-online.target nfdump@default.service rustbgpd.service
+After=network-online.target nfdump@default.service rustbgpd.service
+RequiresMountsFor=/var/cache/nfdump /var/lib/route-optimizer
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=root
+Group=root
+WorkingDirectory=/opt/route-optimizer
+Environment=PYTHONUNBUFFERED=1
+# This is DRY RUN. Adding --apply requires an explicit operator decision.
+ExecStart=/usr/bin/python3 -u /opt/route-optimizer/route-optimizer.py --config /etc/route-optimizer/config.json --bgp-backend rustbgpd --watch 60 --top 50 --max-routes 50
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=20
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,39 @@
+# rustbgpd template for one iBGP peer (UniFi UCG).
+# Documentation IPs only; replace ALL local/neighbor addresses before use.
+# Keep the API on the default owner-only local Unix socket.
+# Check with: rustbgpd --check --strict /etc/rustbgpd/config.toml
+# Ensure rustbgpd can bind TCP/179 (systemd service or CAP_NET_BIND_SERVICE).
+# Do not configure [[fib_tables]]: the UniFi gateway performs forwarding.
+
+[global]
+asn = 65050
+router_id = "192.0.2.50"
+listen_port = 179
+listen_addresses = ["192.0.2.50"]
+runtime_state_dir = "/var/lib/rustbgpd"
+
+[global.telemetry]
+prometheus_addr = "127.0.0.1:9179"
+log_format = "json"
+
+# Only this gateway is a peer. Drop inbound BGP routes on this controller:
+# the optimizer reads IPFIX data, not routes, to choose destinations.
+[policy.definitions.drop-inbound]
+default_action = "deny"
+
+# Locally injected optimizer routes need to be exported to the UCG.
+# This is intentionally broad for ONE tightly controlled iBGP peer;
+# keep the UCG's inbound prefix-list/maximum-prefix guardrails enabled.
+[policy.definitions.send-injected]
+default_action = "permit"
+
+[policy]
+import_chain = ["drop-inbound"]
+export_chain = ["send-injected"]
+
+[[neighbors]]
+address = "192.0.2.1"
+remote_asn = 65050
+description = "unifi-optimizer-peer"
+hold_time = 30
+families = ["ipv4_unicast"]

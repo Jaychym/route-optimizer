@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Offline smoke tests; no real nfdump, ExaBGP or WAN access required."""
+"""Offline smoke tests; no real BGP daemon, nfdump or WAN access required."""
 import importlib.util
 import json
 import math
@@ -22,8 +22,8 @@ def module(path, name):
     return mod
 
 
-engine = module(ROOT / 'route-optimizer.py', 'test_optimizer_engine_v33')
-web = module(ROOT / 'route-optimizer-web.py', 'test_optimizer_dashboard_v33')
+engine = module(ROOT / 'route-optimizer.py', 'test_optimizer_engine_v34')
+web = module(ROOT / 'route-optimizer-web.py', 'test_optimizer_dashboard_v34')
 
 
 class MonitoringTests(unittest.TestCase):
@@ -99,6 +99,76 @@ class MonitoringTests(unittest.TestCase):
             self.assertEqual(engine.bgp_health()['status'], 'down')
         with patch.object(engine, 'command', return_value=CompletedProcess([], 1, '', 'CLI unavailable')):
             self.assertEqual(engine.bgp_health()['status'], 'unknown')
+
+    def test_rustbgpd_session_health_parses_only_target_peer(self):
+        from subprocess import CompletedProcess
+        peer = {'address': '192.168.10.1', 'state': 'Established'}
+        with patch.object(engine, 'BGP_BACKEND', 'rustbgpd'), patch.object(
+                engine, 'command', return_value=CompletedProcess([], 0, json.dumps(peer), '')) as cmd:
+            self.assertEqual(engine.bgp_health()['status'], 'established')
+            self.assertIn('unix:///', cmd.call_args.args[0][2])
+        peer['state'] = 'Active'
+        with patch.object(engine, 'BGP_BACKEND', 'rustbgpd'), patch.object(
+                engine, 'command', return_value=CompletedProcess([], 0, json.dumps(peer), '')):
+            self.assertEqual(engine.bgp_health()['status'], 'down')
+        peer['address'] = '192.168.10.99'
+        peer['state'] = 'Established'
+        with patch.object(engine, 'BGP_BACKEND', 'rustbgpd'), patch.object(
+                engine, 'command', return_value=CompletedProcess([], 0, json.dumps(peer), '')):
+            self.assertEqual(engine.bgp_health()['status'], 'unknown')
+        with patch.object(engine, 'BGP_BACKEND', 'rustbgpd'), patch.object(
+                engine, 'command', return_value=CompletedProcess([], 1, '', 'unavailable')):
+            self.assertEqual(engine.bgp_health()['status'], 'unknown')
+
+    def test_rustbgpd_announcements_and_withdrawal_use_local_cli(self):
+        from subprocess import CompletedProcess
+        prefix = '104.20.27.0/24'
+        with patch.object(engine, 'BGP_BACKEND', 'rustbgpd'), patch.object(
+                engine, 'bgp_health', return_value={'status':'established'}), patch.object(
+                engine, 'command', return_value=CompletedProcess([], 0, 'accepted', '')) as cli:
+            ok, detail = engine.bgp('announce', prefix, 'ISPA', False)
+            self.assertTrue(ok)
+            self.assertIn('DRY-RUN', detail)
+            cli.assert_not_called()
+            ok, detail = engine.bgp('announce', prefix, 'ISPA', True)
+            self.assertTrue(ok)
+            self.assertEqual(cli.call_args.args[0][-4:],
+                             ['add', prefix, '--next-hop', '198.51.100.1'])
+            self.assertEqual(cli.call_args.args[0][:4],
+                             ['/usr/local/bin/rbgp', '-s', engine.RBGPD_SOCKET, 'rib'])
+            ok, _ = engine.bgp('withdraw', prefix, 'ISPA', True)
+            self.assertTrue(ok)
+            self.assertEqual(cli.call_args.args[0][-3:], ['rib', 'delete', prefix])
+            self.assertEqual(cli.call_count, 2)
+
+    def test_rustbgpd_fails_closed_when_peer_unknown_or_command_fails(self):
+        from subprocess import CompletedProcess
+        with patch.object(engine, 'BGP_BACKEND', 'rustbgpd'), patch.object(
+                engine, 'bgp_health', return_value={'status': 'unknown'}), patch.object(
+                engine, 'command') as cli:
+            self.assertFalse(engine.bgp('announce', '104.20.27.0/24', 'ISPA', True)[0])
+            cli.assert_not_called()
+        with patch.object(engine, 'BGP_BACKEND', 'rustbgpd'), patch.object(
+                engine, 'bgp_health', return_value={'status': 'established'}), patch.object(
+                engine, 'command', return_value=CompletedProcess([], 1, '', 'permission denied')):
+            ok, message = engine.bgp('announce', '104.20.27.0/24', 'ISPA', True)
+            self.assertFalse(ok)
+            self.assertIn('permission denied', message)
+
+    def test_backend_ownership_blocks_unsafe_migration_and_reconciles(self):
+        state = engine.new_state()
+        state['routes']['104.20.27.0/24'] = {'isp': 'ISPA', 'next_hop': '198.51.100.1'}
+        with patch.object(engine, 'BGP_BACKEND', 'rustbgpd'):
+            with self.assertRaisesRegex(RuntimeError, 'Persisted routes belong to exabgp'):
+                engine.validate_backend_state(state, True)
+            engine.validate_backend_state(state, False)  # may still monitor in dry-run
+            state['bgp_backend'] = 'rustbgpd'
+            with patch.object(engine, 'bgp', return_value=(True, 'accepted')) as bgp:
+                engine.reconcile_routes(state, True)
+                bgp.assert_called_once_with('announce', '104.20.27.0/24', 'ISPA', True)
+            with patch.object(engine, 'bgp', return_value=(False, 'peer down')):
+                with self.assertRaisesRegex(RuntimeError, 'Cannot reconcile'):
+                    engine.reconcile_routes(state, True)
 
     def test_site_configuration_rejects_missing_wan_protections(self):
         good = {
