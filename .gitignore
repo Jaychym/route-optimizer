@@ -1,0 +1,25 @@
+# Secrets and site configuration: NEVER commit actual LAN/WAN addresses.
+config.json
+*.local.json
+.env
+.env.*
+*.secret
+*.key
+
+# Runtime flow and routing state (may expose destinations and topology)
+state-*.json
+dashboard-*.json
+quality-history-*.json
+route-events-*.json
+*.log
+nfcapd.*
+
+# Python and developer artifacts
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+.DS_Store
+.idea/
+.vscode/
