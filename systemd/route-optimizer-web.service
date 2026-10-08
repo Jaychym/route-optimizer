@@ -1,0 +1,21 @@
+[Unit]
+Description=Route Optimizer v3.3 - read-only local dashboard
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+DynamicUser=yes
+WorkingDirectory=/opt/route-optimizer
+ExecStart=/usr/bin/python3 -u /opt/route-optimizer/route-optimizer-web.py --listen 127.0.0.1 --port 8099
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_INET AF_UNIX
+
+[Install]
+WantedBy=multi-user.target
