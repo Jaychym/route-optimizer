@@ -81,12 +81,12 @@ def configure_site(cfg):
     if not internal or len(connected) < 2:
         raise ValueError("internal_networks and both wan_connected_networks are required")
     own = {v4(x) for x in cfg["own_ips"]}
-    expected = {"FRONTIER", "SPECTRUM"}
+    expected = {"ISPA", "ISPB"}
     declared = cfg["isps"]
     if set(declared) != expected:
-        raise ValueError("isps must have FRONTIER and SPECTRUM keys")
+        raise ValueError("isps must have ISPA and ISPB keys")
     providers = {}
-    for name in ("FRONTIER", "SPECTRUM"):
+    for name in ("ISPA", "ISPB"):
         item = declared[name]
         providers[name] = {"source": v4(item["source"]),
                            "next_hop": v4(item["next_hop"])}
@@ -314,7 +314,7 @@ def record_quality_sample(rows, timestamp=None):
     """
     measurements = []
     for row in rows:
-        fr, sp = row.get("frontier"), row.get("spectrum")
+        fr, sp = row.get("ispa"), row.get("ispb")
         if not isinstance(fr, dict) or not isinstance(sp, dict):
             continue
         if any(m.get("score") is None for m in (fr, sp)):
@@ -322,7 +322,7 @@ def record_quality_sample(rows, timestamp=None):
         measurements.append((fr, sp))
     epoch = ts() if timestamp is None else timestamp
     item = {"epoch": round(epoch, 3), "paired_prefixes": len(measurements)}
-    for idx, isp in enumerate(("frontier", "spectrum")):
+    for idx, isp in enumerate(("ispa", "ispb")):
         vals = [pair[idx] for pair in measurements]
         item[isp] = {
             "rtt_ms": round(statistics.median(v["latency"] for v in vals), 2) if vals else None,
@@ -573,11 +573,11 @@ def aggregate_measurements(row, individual):
     incomplete = 0
     for host in row["hosts"]:
         vals = individual.get(host["ip"], {})
-        frontier, spectrum = vals.get("FRONTIER"), vals.get("SPECTRUM")
-        if not frontier or not spectrum or frontier["method"] != spectrum["method"]:
+        ispa, ispb = vals.get("ISPA"), vals.get("ISPB")
+        if not ispa or not ispb or ispa["method"] != ispb["method"]:
             incomplete += 1
             continue
-        pairs.append((frontier, spectrum))
+        pairs.append((ispa, ispb))
     # At least 2 of 3 or 2 of 2, or 1 of 1 observed targets must be valid
     required = math.ceil(len(row["hosts"]) * (2 / 3))
     if len(pairs) < required:
@@ -600,9 +600,9 @@ def aggregate_measurements(row, individual):
         if not math.isfinite(fr["score"]) or not math.isfinite(sp["score"]):
             continue
         if fr["score"] + MIN_SCORE_IMPROVEMENT <= sp["score"]:
-            opposing.add("FRONTIER")
+            opposing.add("ISPA")
         if sp["score"] + MIN_SCORE_IMPROVEMENT <= fr["score"]:
-            opposing.add("SPECTRUM")
+            opposing.add("ISPB")
     if len(opposing) > 1:
         return None, "CONFLICTING MEMBER HOSTS"
 
@@ -704,7 +704,7 @@ def loss_failover_allowed(results):
         return None
     required = max(EMERGENCY_MIN_HOSTS, math.ceil(len(pairs) * 2 / 3))
     for candidate in ISPS:
-        candidate_index = 0 if candidate == "FRONTIER" else 1
+        candidate_index = 0 if candidate == "ISPA" else 1
         bad_index = 1 - candidate_index
         failures = 0
         for pair in pairs:
@@ -748,7 +748,7 @@ def choose_action(row, measurements, state, apply, limit):
     if current not in ISPS:
         reset_pending(ds)
         return f"OBSERVE ONLY ({current or 'unknown'} WAN)"
-    fr, sp = measurements["FRONTIER"], measurements["SPECTRUM"]
+    fr, sp = measurements["ISPA"], measurements["ISPB"]
     wins = []
     for isp in ISPS:
         if math.isfinite(measurements[isp]["score"]):
@@ -779,7 +779,7 @@ def choose_action(row, measurements, state, apply, limit):
         reset_pending(ds)
         return "CURRENT PATH FAILED; waiting emergency confirmation"
 
-    other = "SPECTRUM" if current == "FRONTIER" else "FRONTIER"
+    other = "ISPB" if current == "ISPA" else "ISPA"
     old_score, new_score = measurements[current]["score"], measurements[other]["score"]
     diff = old_score - new_score
     pct = diff / old_score * 100 if old_score > 0 else 0.0
@@ -847,7 +847,7 @@ def cycle(state, args):
     print(f"Prefix /{PREFIX_LENGTH} | top {args.top} | win {WIN_STREAK_REQUIRED} | "
           f"quiet {QUIET_SECONDS}s | hold {HOLD_DOWN}s | "
           f"routes {len(state['routes'])}/{args.max_routes}")
-    print(f"{'Prefix':<19} {'MiB':>8} {'Hosts':>5} {'Observed':<9} {'Route':<9} {'Frontier':>20} {'Spectrum':>20}  Action")
+    print(f"{'Prefix':<19} {'MiB':>8} {'Hosts':>5} {'Observed':<9} {'Route':<9} {'ISPA':>20} {'ISPB':>20}  Action")
     print("-" * 149)
     handled = set()
     dashboard_rows = []
@@ -869,14 +869,14 @@ def cycle(state, args):
         installed = state["routes"].get(prefix, {}).get("isp", "-")
         print(f"{prefix:<19} {row['bytes']/1048576:8.2f} {len(row['hosts']):5d} "
               f"{str(row['current'] or '-'):9.9} {installed:9.9} "
-              f"{fmt_probe(measurements.get('FRONTIER') if measurements else None):>20} "
-              f"{fmt_probe(measurements.get('SPECTRUM') if measurements else None):>20}  {action}", flush=True)
+              f"{fmt_probe(measurements.get('ISPA') if measurements else None):>20} "
+              f"{fmt_probe(measurements.get('ISPB') if measurements else None):>20}  {action}", flush=True)
         dashboard_rows.append({
             "prefix": prefix, "mib": round(row["bytes"] / 1048576, 3),
             "hosts": len(row["hosts"]), "representatives": [h["ip"] for h in row["hosts"]],
             "observed": row["current"] or "UNKNOWN", "route": installed,
-            "frontier": status_measurement(measurements.get("FRONTIER") if measurements else None),
-            "spectrum": status_measurement(measurements.get("SPECTRUM") if measurements else None),
+            "ispa": status_measurement(measurements.get("ISPA") if measurements else None),
+            "ispb": status_measurement(measurements.get("ISPB") if measurements else None),
             "action": action, "last_seen": row.get("last_seen"),
         })
     sweep_messages = expiry_sweep(state, records, handled, args.apply)
@@ -891,8 +891,8 @@ def cycle(state, args):
     ipfix_status = ("no_data" if flow_age is None else
                     "fresh" if flow_age <= 180 else "stale")
     failing_prefixes = sum(1 for r in dashboard_rows if (
-        r["frontier"] is None or r["spectrum"] is None or
-        r["frontier"].get("score") is None or r["spectrum"].get("score") is None))
+        r["ispa"] is None or r["ispb"] is None or
+        r["ispa"].get("score") is None or r["ispb"].get("score") is None))
     bgp_status = bgp_health()
     try:
         record_quality_sample(dashboard_rows, cycle_epoch)

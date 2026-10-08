@@ -33,8 +33,8 @@ class MonitoringTests(unittest.TestCase):
             "own_ips": ["192.168.10.50", "10.250.1.2", "10.250.2.2"],
             "internal_networks": ["192.168.10.0/24"],
             "wan_connected_networks": ["198.51.100.0/24", "203.0.113.0/24"],
-            "isps": {"FRONTIER": {"source": "10.250.1.2", "next_hop": "198.51.100.1"},
-                     "SPECTRUM": {"source": "10.250.2.2", "next_hop": "203.0.113.1"}},
+            "isps": {"ISPA": {"source": "10.250.1.2", "next_hop": "198.51.100.1"},
+                     "ISPB": {"source": "10.250.2.2", "next_hop": "203.0.113.1"}},
         })
         self.dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.dir.cleanup)
@@ -51,18 +51,18 @@ class MonitoringTests(unittest.TestCase):
 
     def test_history_uses_comparable_prefixes_and_bounded_samples(self):
         rows = [
-            {'frontier': {'latency': 10., 'jitter': 1., 'loss': 0., 'score': 12.},
-             'spectrum': {'latency': 20., 'jitter': 2., 'loss': 20., 'score': 524.}},
-            {'frontier': {'latency': 12., 'jitter': 2., 'loss': 0., 'score': 16.},
-             'spectrum': {'latency': 22., 'jitter': 3., 'loss': 0., 'score': 28.}},
-            {'frontier': {'latency': None, 'jitter': None, 'loss': None, 'score': None},
-             'spectrum': {'latency': 80., 'jitter': 10., 'loss': 0., 'score': 90.}},
+            {'ispa': {'latency': 10., 'jitter': 1., 'loss': 0., 'score': 12.},
+             'ispb': {'latency': 20., 'jitter': 2., 'loss': 20., 'score': 524.}},
+            {'ispa': {'latency': 12., 'jitter': 2., 'loss': 0., 'score': 16.},
+             'ispb': {'latency': 22., 'jitter': 3., 'loss': 0., 'score': 28.}},
+            {'ispa': {'latency': None, 'jitter': None, 'loss': None, 'score': None},
+             'ispb': {'latency': 80., 'jitter': 10., 'loss': 0., 'score': 90.}},
         ]
         sample = engine.record_quality_sample(rows, timestamp=123)
         self.assertEqual(sample['paired_prefixes'], 2)
-        self.assertEqual(sample['frontier']['rtt_ms'], 11)
-        self.assertEqual(sample['spectrum']['rtt_ms'], 21)
-        self.assertEqual(sample['spectrum']['loss_percent'], 10)
+        self.assertEqual(sample['ispa']['rtt_ms'], 11)
+        self.assertEqual(sample['ispb']['rtt_ms'], 21)
+        self.assertEqual(sample['ispb']['loss_percent'], 10)
         self.assertEqual(json.loads(engine.HISTORY_FILE.read_text())[0], sample)
         with patch.object(engine, 'HISTORY_MAX_SAMPLES', 2):
             engine.record_quality_sample(rows, timestamp=124)
@@ -73,14 +73,14 @@ class MonitoringTests(unittest.TestCase):
         state = engine.new_state()
         prefix = '104.20.27.0/24'
         with patch.object(engine, 'bgp', return_value=(True, 'accepted')) as mocked:
-            ok, _ = engine.announce(prefix, 'FRONTIER', state, False, 50, 'hypothetical')
+            ok, _ = engine.announce(prefix, 'ISPA', state, False, 50, 'hypothetical')
             self.assertTrue(ok)
             self.assertFalse(engine.ROUTE_EVENTS_FILE.exists())
             self.assertEqual(state['routes'], {})
-            ok, _ = engine.announce(prefix, 'FRONTIER', state, True, 50, 'latency advantage')
+            ok, _ = engine.announce(prefix, 'ISPA', state, True, 50, 'latency advantage')
             self.assertTrue(ok)
-            self.assertEqual(state['routes'][prefix]['isp'], 'FRONTIER')
-            ok, _ = engine.announce(prefix, 'SPECTRUM', state, True, 50, 'severe loss')
+            self.assertEqual(state['routes'][prefix]['isp'], 'ISPA')
+            ok, _ = engine.announce(prefix, 'ISPB', state, True, 50, 'severe loss')
             self.assertTrue(ok)
             ok, _ = engine.withdraw(prefix, state, True)
             self.assertTrue(ok)
@@ -88,8 +88,8 @@ class MonitoringTests(unittest.TestCase):
         self.assertEqual(state['routes'], {})
         events = json.loads(engine.ROUTE_EVENTS_FILE.read_text())
         self.assertEqual([x['event'] for x in events], ['withdraw', 'move', 'announce'])
-        self.assertEqual(events[0]['from'], 'SPECTRUM')
-        self.assertEqual(events[1]['to'], 'SPECTRUM')
+        self.assertEqual(events[0]['from'], 'ISPB')
+        self.assertEqual(events[1]['to'], 'ISPB')
 
     def test_bgp_health_unknown_vs_established(self):
         from subprocess import CompletedProcess
@@ -106,8 +106,8 @@ class MonitoringTests(unittest.TestCase):
             "own_ips": ["192.168.10.50", "10.250.1.2", "10.250.2.2"],
             "internal_networks": ["192.168.10.0/24"],
             "wan_connected_networks": ["198.51.100.0/24", "203.0.113.0/24"],
-            "isps": {"FRONTIER": {"source": "10.250.1.2", "next_hop": "198.51.100.1"},
-                     "SPECTRUM": {"source": "10.250.2.2", "next_hop": "203.0.113.1"}},
+            "isps": {"ISPA": {"source": "10.250.1.2", "next_hop": "198.51.100.1"},
+                     "ISPB": {"source": "10.250.2.2", "next_hop": "203.0.113.1"}},
         }
         import copy
         wrong = copy.deepcopy(good)
@@ -126,7 +126,7 @@ class MonitoringTests(unittest.TestCase):
     def test_public_config_example_is_syntactically_valid(self):
         path = ROOT.parent / "examples" / "config.example.json"
         engine.configure_site(json.loads(path.read_text(encoding="utf-8")))
-        self.assertEqual(set(engine.ISPS), {"FRONTIER", "SPECTRUM"})
+        self.assertEqual(set(engine.ISPS), {"ISPA", "ISPB"})
 
     def test_http_get_and_no_route_write_api(self):
         status = {'epoch': 1, 'rows': [], 'mode': 'DRY-RUN'}

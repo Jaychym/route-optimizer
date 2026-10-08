@@ -12,7 +12,7 @@ A **self-hosted, experimental dual-WAN outbound route optimizer** for a UniFi ga
 - Exposes a **read-only** web UI with IPFIX and BGP health, active optimizer-managed routes, destination decisions and quality graphs (HTTP on port 8099).
 - Keeps records across restarts in local JSON state; maintains bounded quality and route-event history.
 
-Current implementation expects exactly two ISP labels, `FRONTIER` and `SPECTRUM` (used as friendly labels in the code/dashboard). These are **labels**, not integration requirements. Rename the labels consistently in code if you use different ISPs. Internet traffic must be NATed by the gateway on each selected WAN.
+Current implementation expects exactly two ISP labels, `ISPA` and `ISPB` (used as friendly labels in the code/dashboard). These are **labels**, not integration requirements. Rename the labels consistently in code if you use different ISPs. Internet traffic must be NATed by the gateway on each selected WAN.
 
 ## Architecture
 
