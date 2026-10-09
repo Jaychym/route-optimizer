@@ -38,7 +38,9 @@ flowchart TB
 - An **Established rustbgpd iBGP session** with UniFi, an inbound deny-first BGP route-map/prefix-list rejecting unsafe routes, and a strongly recommended neighbor maximum-prefix above the optimizer cap (e.g. 75 for a 50-route limit).
 - Independent SSH/console recovery before changing routes. **UniFi must route the two probe-source VLANs using rules before its main-table lookup**, because installed BGP `/24`s can otherwise hijack the other WAN's probes. Confirm physical egress/NAT via packet captures *while a test BGP route exists*. UniFi reloads or firmware updates can remove custom rules; verify repair and reboot persistence on your gateway.
 
-**Performance warning:** Enabling NetFlow/IPFIX export can disable hardware acceleration on some UniFi gateways and noticeably reduce throughput. Benchmark wired throughput and CPU usage before relying on continuous export. Never point the collector to the Internet.
+**Performance warning:** Enabling NetFlow/IPFIX export can affect hardware acceleration and throughput on some UniFi gateway models and firmware versions. Benchmark wired throughput and CPU usage before and after enabling export; never point the collector to the Internet.
+
+**Field observation (one deployment):** On a **UniFi Cloud Gateway Ultra running UniFi OS 5.1.33**, the operator continued achieving approximately **500 Mbps down / 500 Mbps up** (the full provisioned connection speed) with IPFIX export enabled. This does **not** verify hardware-acceleration status or available CPU headroom, nor does it guarantee throughput at higher link speeds, on other models, or with different traffic loads.
 
 ## Installation (new deployment)
 
