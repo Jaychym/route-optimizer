@@ -26,10 +26,9 @@ from pathlib import Path
 
 # --- Site settings -----------------------------------------------------------
 NFDUMP = "/usr/bin/nfdump"
-EXABGP_CLI = "/usr/bin/exabgp-cli"
 RBGPD_CLI = "/usr/local/bin/rbgp"
 RBGPD_SOCKET = "unix:///var/lib/rustbgpd/grpc.sock"
-BGP_BACKEND = "exabgp"  # Explicit opt-in to rustbgpd. Existing installs keep working.
+BGP_BACKEND = "rustbgpd"  # Sole supported BGP daemon.
 RBGPD_RECONCILE_SECONDS = 300
 FLOW_DIR = "/var/cache/nfdump"
 STATE_FILE = Path("/var/lib/route-optimizer/state-v3.json")
@@ -363,49 +362,37 @@ def record_quality_sample(rows, timestamp=None):
 
 
 def bgp_health():
-    """Query the selected local BGP daemon; unknown is not the same as down."""
+    """Confirm rustbgpd peer state; unknown is not the same as healthy."""
     try:
-        if BGP_BACKEND == "rustbgpd":
-            # `rbgp --json neighbor <ip>` has a documented `state` field.
-            p = command([RBGPD_CLI, "-s", RBGPD_SOCKET, "--json", "neighbor", BGP_PEER], timeout=8)
-            if p.returncode != 0:
-                return {"status": "unknown", "detail": "rustbgpd neighbor query failed"}
-            try:
-                peer = json.loads(p.stdout)
-            except (TypeError, ValueError):
-                return {"status": "unknown", "detail": "Invalid rustbgpd neighbor JSON"}
-            if not isinstance(peer, dict) or peer.get("address") != BGP_PEER:
-                return {"status": "unknown", "detail": "rustbgpd peer identity mismatch"}
-            state = str(peer.get("state", "")).lower()
-            if state == "established":
-                return {"status": "established", "detail": f"rustbgpd peer {BGP_PEER}"}
-            if state in {"idle", "connect", "active", "opensent", "openconfirm", "stale"}:
-                return {"status": "down", "detail": f"rustbgpd peer {BGP_PEER}: {state}"}
-            return {"status": "unknown", "detail": "rustbgpd neighbor state unavailable"}
-        p = command(["sudo", EXABGP_CLI, "show neighbor summary"], timeout=8)
-        output = ((p.stdout or "") + "\n" + (p.stderr or ""))[:4096]
+        p = command([RBGPD_CLI, "-s", RBGPD_SOCKET, "--json", "neighbor", BGP_PEER], timeout=8)
         if p.returncode != 0:
-            return {"status": "unknown", "detail": "ExaBGP CLI query failed"}
-        lines = [line.strip() for line in output.splitlines() if BGP_PEER in line]
-        if not lines:
-            return {"status": "unknown", "detail": "Neighbor not present in CLI summary"}
-        status = "established" if any(re.search(r"\bestablished\b", line, re.I) for line in lines) else "down"
-        return {"status": status, "detail": f"ExaBGP peer {BGP_PEER}"}
+            return {"status": "unknown", "detail": "rustbgpd neighbor query failed"}
+        try:
+            peer = json.loads(p.stdout)
+        except (TypeError, ValueError):
+            return {"status": "unknown", "detail": "Invalid rustbgpd neighbor JSON"}
+        if not isinstance(peer, dict) or peer.get("address") != BGP_PEER:
+            return {"status": "unknown", "detail": "rustbgpd peer identity mismatch"}
+        state = str(peer.get("state", "")).lower()
+        if state == "established":
+            return {"status": "established", "detail": f"rustbgpd peer {BGP_PEER}"}
+        if state in {"idle", "connect", "active", "opensent", "openconfirm", "stale"}:
+            return {"status": "down", "detail": f"rustbgpd peer {BGP_PEER}: {state}"}
+        return {"status": "unknown", "detail": "rustbgpd neighbor state unavailable"}
     except (OSError, subprocess.TimeoutExpired):
-        return {"status": "unknown", "detail": f"{BGP_BACKEND} CLI unavailable"}
+        return {"status": "unknown", "detail": "rustbgpd CLI unavailable"}
 
 
 def validate_backend_state(state, apply):
-    """Prevent old ExaBGP ownership from being replayed with a new daemon."""
+    """Never replay untagged/legacy routes with a different BGP daemon."""
     if not apply or not state["routes"]:
         return
-    # Versions <=3.3 recorded no backend; all of their routes used ExaBGP.
-    existing = state.get("bgp_backend", "exabgp")
-    if existing != BGP_BACKEND:
+    existing = state.get("bgp_backend", "legacy")
+    if existing != "rustbgpd":
         raise RuntimeError(
-            f"Persisted routes belong to {existing}, not {BGP_BACKEND}. "
-            "Withdraw them with the original backend and confirm on the UCG "
-            "before changing backend; do not delete state blindly.")
+            f"Persisted routes belong to {existing}, not rustbgpd. "
+            "Withdraw them with the original deployment and confirm on UniFi "
+            "before switching; do not delete state blindly.")
 
 
 def status_measurement(measurement):
@@ -670,38 +657,26 @@ def aggregate_measurements(row, individual):
 
 # --- BGP action helpers ------------------------------------------------------
 def bgp(action, prefix, isp, apply):
-    """Perform one route mutation using the explicitly selected BGP backend.
-
-    `--apply` is the sole switch that authorizes writes. No route updates are
-    exposed to the dashboard and no BGP daemon is changed in dry-run.
-    """
+    """Use only rustbgpd's owner-local socket; --apply is required for writes."""
     nh = ISPS[isp]["next_hop"]
     if not apply:
-        return True, f"DRY-RUN ({BGP_BACKEND}): {action} {prefix} next-hop {nh}"
-    if BGP_BACKEND == "rustbgpd":
-        # Fail closed: local API admission does not prove advertisement to UCG.
-        if bgp_health()["status"] != "established":
-            return False, "rustbgpd peer not confirmed Established"
-        if action == "announce":
-            cmd = [RBGPD_CLI, "-s", RBGPD_SOCKET, "rib", "add", prefix,
-                   "--next-hop", nh]
-        elif action == "withdraw":
-            cmd = [RBGPD_CLI, "-s", RBGPD_SOCKET, "rib", "delete", prefix]
-        else:
-            return False, f"unsupported BGP action {action}"
-    elif BGP_BACKEND == "exabgp":
-        if action not in {"announce", "withdraw"}:
-            return False, f"unsupported BGP action {action}"
-        cmd = ["sudo", EXABGP_CLI, f"{action} route {prefix} next-hop {nh}"]
+        return True, f"DRY-RUN (rustbgpd): {action} {prefix} next-hop {nh}"
+    if bgp_health()["status"] != "established":
+        return False, "rustbgpd peer not confirmed Established"
+    if action == "announce":
+        cmd = [RBGPD_CLI, "-s", RBGPD_SOCKET, "rib", "add", prefix,
+               "--next-hop", nh]
+    elif action == "withdraw":
+        cmd = [RBGPD_CLI, "-s", RBGPD_SOCKET, "rib", "delete", prefix]
     else:
-        return False, f"unknown BGP backend {BGP_BACKEND}"
+        return False, f"unsupported BGP action {action}"
     try:
         proc = command(cmd, timeout=20)
     except (OSError, subprocess.TimeoutExpired) as exc:
-        return False, f"{BGP_BACKEND} CLI error: {exc}"
+        return False, f"rustbgpd CLI error: {exc}"
     if proc.returncode != 0:
         return False, (proc.stderr or proc.stdout or "BGP CLI failed").strip()[:500]
-    # CLI success is local API acceptance, NOT verified gateway FIB installation.
+    # CLI success means local daemon acceptance, not gateway FIB confirmation.
     return True, (proc.stdout or "command accepted locally").strip()[:500]
 
 
@@ -718,7 +693,7 @@ def announce(prefix, isp, state, apply, limit, reason):
     if ok and apply:
         routes[prefix] = {"isp": isp, "next_hop": ISPS[isp]["next_hop"],
                           "changed_at": ts(), "reason": reason}
-        state["bgp_backend"] = BGP_BACKEND
+        state["bgp_backend"] = "rustbgpd"
         save_state(state, ACTIVE_STATE_PATH)
         try:
             record_route_event("move" if old else "announce", prefix,
@@ -1019,8 +994,9 @@ def main():
     parser.add_argument("--config", type=Path, default=Path("/etc/route-optimizer/config.json"),
                         help="site-specific JSON config (required)")
     parser.add_argument("--apply", action="store_true", help="enable actual BGP route changes")
-    parser.add_argument("--bgp-backend", choices=("exabgp", "rustbgpd"), default="exabgp",
-                        help="BGP daemon to use (default: exabgp for backwards compatibility)")
+    # Compatibility with deployed v3.4 units; rustbgpd is now the only backend.
+    parser.add_argument("--bgp-backend", choices=("rustbgpd",), default="rustbgpd",
+                        help=argparse.SUPPRESS)
     parser.add_argument("--rbgp-cli", default=RBGPD_CLI, help="path to rustbgpd rbgp CLI")
     parser.add_argument("--rbgp-socket", default=RBGPD_SOCKET, help="local rustbgpd gRPC UDS URI")
     parser.add_argument("--watch", metavar="SECONDS", type=int, default=0, help="repeat every N seconds")
@@ -1037,7 +1013,7 @@ def main():
     BGP_BACKEND = args.bgp_backend
     RBGPD_CLI = args.rbgp_cli
     RBGPD_SOCKET = args.rbgp_socket
-    if BGP_BACKEND == "rustbgpd" and not RBGPD_SOCKET.startswith("unix:///"):
+    if not RBGPD_SOCKET.startswith("unix:///"):
         parser.error("rustbgpd requires a local unix:/// gRPC socket (no network listener)")
     if not (1 <= args.max_routes <= HARD_MAX_ROUTES):
         parser.error(f"--max-routes must be between 1 and {HARD_MAX_ROUTES}")
@@ -1070,7 +1046,7 @@ def main():
                 # rustbgpd local injected routes can disappear after its restart.
                 # Re-announce the small, tracked route set periodically in live
                 # mode, without altering hold-downs or generating move events.
-                if (BGP_BACKEND == "rustbgpd" and args.apply and state["routes"]
+                if (args.apply and state["routes"]
                         and start - last_reconcile >= RBGPD_RECONCILE_SECONDS):
                     reconcile_routes(state, True)
                     last_reconcile = time.monotonic()

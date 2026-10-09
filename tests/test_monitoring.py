@@ -91,14 +91,17 @@ class MonitoringTests(unittest.TestCase):
         self.assertEqual(events[0]['from'], 'ISPB')
         self.assertEqual(events[1]['to'], 'ISPB')
 
-    def test_bgp_health_unknown_vs_established(self):
+    def test_rustbgpd_only_and_missing_peer_fail_closed(self):
         from subprocess import CompletedProcess
-        with patch.object(engine, 'command', return_value=CompletedProcess([], 0, '192.168.10.1 65050 ... established 3 0', '')):
-            self.assertEqual(engine.bgp_health()['status'], 'established')
-        with patch.object(engine, 'command', return_value=CompletedProcess([], 0, '192.168.10.1 65050 ... active 3 0', '')):
-            self.assertEqual(engine.bgp_health()['status'], 'down')
-        with patch.object(engine, 'command', return_value=CompletedProcess([], 1, '', 'CLI unavailable')):
-            self.assertEqual(engine.bgp_health()['status'], 'unknown')
+        self.assertEqual(engine.BGP_BACKEND, "rustbgpd")
+        self.assertFalse(hasattr(engine, "EXABGP_CLI"))
+        peer = {"address": "192.168.10.1", "state": "Established"}
+        with patch.object(engine, "command", return_value=CompletedProcess([], 0, json.dumps(peer), "")):
+            self.assertEqual(engine.bgp_health()["status"], "established")
+        with patch.object(engine, "command", return_value=CompletedProcess([], 1, "", "connection refused")):
+            self.assertEqual(engine.bgp_health()["status"], "unknown")
+        with patch.object(engine, "command", return_value=CompletedProcess([], 0, "{", "")):
+            self.assertEqual(engine.bgp_health()["status"], "unknown")
 
     def test_rustbgpd_session_health_parses_only_target_peer(self):
         from subprocess import CompletedProcess
@@ -159,7 +162,7 @@ class MonitoringTests(unittest.TestCase):
         state = engine.new_state()
         state['routes']['104.20.27.0/24'] = {'isp': 'ISPA', 'next_hop': '198.51.100.1'}
         with patch.object(engine, 'BGP_BACKEND', 'rustbgpd'):
-            with self.assertRaisesRegex(RuntimeError, 'Persisted routes belong to exabgp'):
+            with self.assertRaisesRegex(RuntimeError, 'Persisted routes belong to legacy'):
                 engine.validate_backend_state(state, True)
             engine.validate_backend_state(state, False)  # may still monitor in dry-run
             state['bgp_backend'] = 'rustbgpd'
