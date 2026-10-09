@@ -1,118 +1,139 @@
-# Experimental rustbgpd backend (v3.4)
+# rustbgpd deployment and legacy migration (v3.4)
 
-Route Optimizer can now call the `rbgp` CLI instead of `exabgp-cli`. **Existing
-installations continue using ExaBGP by default.** This is an integration
-candidate, not yet an end-to-end UniFi forwarding test. The API-first daemon
-is alpha outside its [narrow v1 contract](https://github.com/lance0/rustbgpd/blob/main/docs/reference/v1-stable-contract.md).
-Pin a tested rustbgpd release instead of tracking `main` for unattended use.
+**rustbgpd is the only supported BGP daemon.** The optimizer uses the
+`rbgp` CLI over rustbgpd's local Unix gRPC socket. Pin a tested release;
+the daemon is experimental outside its [stable v1
+contract](https://github.com/lance0/rustbgpd/blob/main/docs/reference/v1-stable-contract.md).
 
-## What changes
+## New deployment
 
-- **Unchanged:** IPFIX/nfdump, probes, prefix scoring, 3-win/quiet/hold-down
-  safety policy, read-only dashboard, UniFi inbound BGP prefix filters.
-- **Private ISP labels:** optionally set `isp_labels` in the local JSON config
-  to customize dashboard and console names. Do not rename the `isps` keys
-  (`ISPA`/`ISPB`), which remain stable routing and state identifiers.
-- **Changed:** BGP peer is served by rustbgpd; `rbgp rib add` / `rib delete`
-  perform route changes through a local Unix gRPC socket.
-- **State ownership:** v3.3 state with installed routes implicitly belongs to
-  ExaBGP. Live rustbgpd refuses to reuse it until those routes are withdrawn.
-- **Route admission:** successful `rbgp` commands indicate **local daemon
-  acceptance**, not proof of UniFi's BGP RIB, FIB, or actual WAN forwarding.
-- **Restarts:** startup and periodic (5-minute) reconciliation re-announces
-  persisted routes while the rustbgpd peer is confirmed Established. Disruption
-  and loss of connectivity are still possible when BGP restarts.
+1. Back up UniFi's complete FRR/BGP configuration, optimizer scripts,
+   systemd units and route state; preserve independent management access.
+2. Install pinned rustbgpd using [the upstream deployment
+   guide](https://github.com/lance0/rustbgpd/blob/main/docs/how-to/deployment.md).
+   Customize `examples/rustbgpd.toml.example` to use your private AS,
+   management IP and UniFi peer. Validate with
+   `sudo rustbgpd --check --strict /etc/rustbgpd/config.toml`. Install
+   the upstream rustbgpd systemd unit and use its local Unix socket.
+3. Ensure the UniFi inbound BGP prefix list/route map blocks internal,
+   special-use and WAN-connected destinations. Use a maximum-prefix limit
+   greater than `--max-routes` where supported. Do not replace other
+   BGP/OSPF sections when importing a routing configuration.
+4. Start rustbgpd, confirm `sudo rbgp summary` is Established, and
+   ensure a single speaker serves the peer. The default
+   `systemd/route-optimizer.service` is a **dry-run** unit.
+5. Configure the local **untracked**
+   `/etc/route-optimizer/config.json`. The required `isps` keys stay
+   `ISPA`/`ISPB`; use optional `isp_labels` for friendly names.
+   Confirm flow freshness, both probes, BGP health, and dashboard metrics.
+6. With a rollback procedure ready, test one eligible public `/24`:
+   announce using `rbgp rib add PREFIX --next-hop REAL_WAN_GATEWAY`,
+   confirm UniFi BGP RIB and Linux FIB use the real WAN gateway, capture
+   physical egress and NAT, then withdraw using `rbgp rib delete PREFIX`.
+   Local CLI acceptance alone does not prove a UniFi route is installed.
+7. Only enable `--apply` after those checks; start with a low route cap,
+   watch route-event history and verify actual UniFi-installed routes.
 
-## Prepare (no production cutover yet)
+## Critical probe-routing isolation on UniFi
 
-1. Verify UniFi has your existing inbound public-prefix filters and
-   `maximum-prefix` set safely above `--max-routes` (75 for 50 managed routes).
-   Keep your current gateway BGP config backed up.
-2. Install a pinned rustbgpd release following its official
-   [deployment documentation](https://github.com/lance0/rustbgpd/blob/main/docs/how-to/deployment.md)
-   on the *same* VM as the optimizer. The `rbgp` executable must be at
-   `/usr/local/bin/rbgp`, unless `--rbgp-cli` overrides it.
-3. Customize [`examples/rustbgpd.toml.example`](../examples/rustbgpd.toml.example)
-   to your own AS, management IP and UCG BGP peer; validate it with
-   `rustbgpd --check --strict /etc/rustbgpd/config.toml`. The local API is an
-   owner-only UDS by default; do NOT expose it on a LAN TCP interface.
-4. Keep your running optimizer service in **dry-run**. The file
-   [`systemd/route-optimizer-rustbgpd.service.example`](../systemd/route-optimizer-rustbgpd.service.example)
-   is a reference unit, not a replacement auto-installed by the project.
-   Do **not** launch two optimizer instances sharing `/var/lib/route-optimizer`
-   or the same probe/source routing configuration.
-5. After the BGP session has transitioned to rustbgpd, run the read-only CLI:
+The optimizer VM must route each probe source to the correct probe VLAN,
+but **VM-side source rules alone are insufficient**.
 
-   ```bash
-   rbgp -s unix:///var/lib/rustbgpd/grpc.sock --json neighbor <UCG_BGP_IP>
-   rbgp -s unix:///var/lib/rustbgpd/grpc.sock rib
-   ```
+When UniFi installs an optimizer BGP `/24` in its main table, that
+specific route can take precedence over UniFi's normal WAN policy routing
+and send *both* probes through the same WAN. This falsifies path-quality
+comparisons. On UniFi, add narrowly scoped rules matching the probe
+source **and ingress interface**, evaluated before `from all lookup main`:
 
-   The first command must show an `Established` neighbor state.
+```text
+from <PROBE_A_SOURCE_IP> iif <PROBE_A_VLAN> lookup <WAN_A_ROUTE_TABLE>
+from <PROBE_B_SOURCE_IP> iif <PROBE_B_VLAN> lookup <WAN_B_ROUTE_TABLE>
+```
 
-## Controlled cutover checklist
+Choose actual table names and free rule priorities from
+`ip -4 rule show` and `ip -4 route show table all`. Check both with
+`ip -4 route get <PUBLIC_IP> from <PROBE_IP> iif <VLAN_INTERFACE>`
+**while a test BGP route is installed**. Prove independent physical
+egress and return NAT with simultaneous captures on both WAN interfaces.
+Do not assume a normal UI traffic-route rule precedes the BGP route.
 
-**Do this only in a scheduled test window after a rollback plan.** Migrating
-BGP daemons restarts the iBGP session, even when the UCG configuration remains
-unchanged. Routes must not be left installed under the former daemon.
+Custom rules are not guaranteed to survive UniFi reprovisioning, firmware
+updates or reboots. Provide a local boot-time restore and watchdog,
+test restoration after deletion, and **separately** verify persistence
+after reboot before using unattended live routing. If WAN-specific
+tables lose their default routes, probe policy should fail closed
+rather than fall through to the main table.
 
-1. Back up `/opt/route-optimizer`, `/var/lib/route-optimizer` and the gateway BGP
-   configuration. Confirm console/SSH access independent of the WAN being moved.
-2. Before stopping ExaBGP, stop the optimizer service and use its **old**
-   `--bgp-backend exabgp --withdraw-all --apply` invocation with the real
-   site config and state file. Inspect the UCG route table and confirm the old
-   optimizer `/24` routes are gone. **Do not simply erase the state file.**
-   If routes were previously created with a pre-v3.3 script, verify old `/32`
-   routes are gone as well.
-3. Stop/disable `exabgp.service` and start `rustbgpd.service` with the customized
-   TOML. Inspect `rbgp --json neighbor <UCG_IP>` and the UCG BGP neighbor state.
-   Confirm only *one* BGP speaker is bound to port 179 / peered with the UCG.
-4. Install the new optimizer script and use `--bgp-backend rustbgpd` in **dry-run**;
-   verify BGP health, IPFIX age, representative probes, and the dashboard.
-5. In a controlled manual test, inject **one already observed eligible public**
-   `/24` using `rbgp rib add <PUBLIC_PREFIX> --next-hop <WAN_GATEWAY_IP>`.
-   Verify in UCG FRR **and** the kernel FIB that the next hop is the real WAN
-   gateway rather than the optimizer VM, then confirm forwarding egress and
-   connectivity. Remove with `rbgp rib delete <PUBLIC_PREFIX>`. Never test
-   this with documentation, local, or connected WAN prefixes.
-6. Only after manual forwarding works, add `--apply` to the rustbgpd optimizer
-   service. Prefer a temporarily reduced `--max-routes` and watch route events.
-   Do not use the dashboard as a route-control API.
+### Field-validation status
+
+On a UCG-Ultra test environment using UniFi OS 5.1.33 and rustbgpd
+v0.75.0, the following were observed:
+
+- rustbgpd peer Established; one eligible public `/24` announced,
+  selected and installed in UniFi's FIB using its actual WAN gateway.
+- The test route was withdrawn successfully.
+- Source/iif routing lookups selected different WAN tables.
+- Separate WAN packet captures confirmed three transmitted ICMP probes
+  and three replies through **each** physical WAN with the proper NAT
+  source addresses even with an installed BGP route.
+- A periodic watchdog restored a deliberately deleted probe policy rule.
+
+**Not yet validated:** persistence of the custom UniFi boot service/rules
+after a full gateway reboot. These field tests do not guarantee
+compatibility with other models/firmware.
+
+## Migrating from a legacy ExaBGP installation
+
+ExaBGP is no longer an engine dependency or available routing backend.
+The legacy tool is needed **only if you must withdraw older routes before
+the cutover**:
+
+1. Stop the *old* optimizer, withdraw legacy-advertised routes using its
+   original tooling/state, and inspect the UCG's RIB/FIB. Old `/32`
+   routes may also need clearing. **Do not simply delete route state.**
+2. Stop/disable the legacy BGP daemon. Start rustbgpd using the new
+   configuration and verify the session Established.
+3. Keep a backup of old state and use a new state file for the rustbgpd
+   deployment where appropriate. New live mode refuses to replay an
+   untagged/legacy state with installed routes.
+4. Run the new optimizer in dry-run, then verify manual route
+   injection/withdrawal and independent WAN egress as above.
+5. Enable live routing only after verifying probe rules remain present
+   and your chosen recovery mechanism works.
+
+The legacy `--bgp-backend rustbgpd` option remains **accepted** so
+existing rustbgpd v3.4 services can be upgraded without rewriting
+their command lines. Other `--bgp-backend` values are rejected.
 
 ## Commands
 
 ```bash
-# Read-only neighbor health on the local Unix socket:
-rbgp -s unix:///var/lib/rustbgpd/grpc.sock --json neighbor <UCG_BGP_IP>
+sudo rbgp summary
+sudo rbgp rib sent <UCG_PEER_IP>
 
-# Example use with documentation IPs only (NOT to be run unchanged):
-rbgp -s unix:///var/lib/rustbgpd/grpc.sock rib add 203.0.113.0/24 --next-hop 198.51.100.1
-rbgp -s unix:///var/lib/rustbgpd/grpc.sock rib delete 203.0.113.0/24
+# One dry-run cycle with no BGP changes:
+sudo /opt/route-optimizer/route-optimizer.py \
+  --config /etc/route-optimizer/config.json --top 10 --max-routes 10
 
-# Dry-run on the optimizer VM after stopping the original optimizer process:
+# Controlled rollback for a default-path new installation:
+sudo systemctl stop route-optimizer
 sudo /opt/route-optimizer/route-optimizer.py \
   --config /etc/route-optimizer/config.json \
-  --bgp-backend rustbgpd --watch 60
+  --state /var/lib/route-optimizer/state-v3.json \
+  --withdraw-all --apply
+
+# Then verify peer advertisements and gateway FIB before restoring dry-run.
 ```
 
-The UCG BGP configuration example remains
-[`examples/unifi-bgp.conf.example`](../examples/unifi-bgp.conf.example).
-Its router ID and peer IP must be edited for this topology; it doesn't depend
-on whether ExaBGP or rustbgpd is used on the optimizer VM.
+**For custom deployments:** replace the service and state paths above with
+the paths actually used. Never start a second optimizer with a shared
+state file while the live one is running. Keep rustbgpd Established
+during withdrawal; a failed CLI withdrawal requires manual investigation.
 
-## Rollback
+## Known limitations
 
-Stop the rustbgpd-mode optimizer. While rustbgpd is operational and its BGP
-peer is Established, run `--bgp-backend rustbgpd --withdraw-all --apply` with
-the correct state path. Verify routes are withdrawn from the UCG before
-stopping rustbgpd. Restore ExaBGP, then the old working optimizer service.
-If the daemon/session is already down, use UCG-side verification and remove
-stale advertisements or reset the peer as appropriate; do not assume deleting
-local state withdraws remote BGP routes.
-
-## Known limits
-
-The current engine tracks BGP CLI success and state, but cannot guarantee the
-UCG applied the route. It does not compare rustbgpd's advertised route table
-against the UCG forwarding table. A `rbgp` CLI or neighbor JSON contract change
-could require an adapter update. Route flips can reset active NAT connections.
+Changes to a destination `/24` can reset NAT-backed TCP/UDP/QUIC
+connections. Route state tracks locally accepted BGP commands, not an
+authoritative UniFi FIB inventory. Managed routes are reasserted on
+startup and every five minutes while live. This is experimental
+self-hosted software, not a supported SD-WAN product.
