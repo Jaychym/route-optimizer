@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Route Optimizer v3.3: IPFIX-driven dual-WAN /24 BGP optimization.
+"""Route Optimizer v3.4: IPFIX-driven dual-WAN /24 BGP optimization.
 
 Dry-run by default. Keep v2 and its state file until all old /32s are withdrawn.
 All route changes may reset existing TCP/UDP sessions; flow quietness is an
@@ -26,7 +26,10 @@ from pathlib import Path
 
 # --- Site settings -----------------------------------------------------------
 NFDUMP = "/usr/bin/nfdump"
-EXABGP_CLI = "/usr/bin/exabgp-cli"
+RBGPD_CLI = "/usr/local/bin/rbgp"
+RBGPD_SOCKET = "unix:///var/lib/rustbgpd/grpc.sock"
+BGP_BACKEND = "rustbgpd"  # Sole supported BGP daemon.
+RBGPD_RECONCILE_SECONDS = 300
 FLOW_DIR = "/var/cache/nfdump"
 STATE_FILE = Path("/var/lib/route-optimizer/state-v3.json")
 STATUS_FILE = Path("/var/lib/route-optimizer/dashboard-v3.json")
@@ -52,6 +55,15 @@ BASE_BLOCKED_NETWORKS = tuple(map(ipaddress.ip_network, [
 BLOCKED_NETWORKS = BASE_BLOCKED_NETWORKS
 ISPS = {}
 ISP_BY_NEXTHOP = {}
+ISP_LABELS = {"ISPA": "ISPA", "ISPB": "ISPB"}
+
+
+def display_isp(value):
+    """Format opaque ISP identifiers for operator-facing text only.
+
+    Stored route state, IPFIX measurements and command keys remain ISPA/ISPB.
+    """
+    return re.sub(r"\bISPA\b|\bISPB\b", lambda m: ISP_LABELS[m.group()], str(value))
 
 
 def configure_site(cfg):
@@ -61,7 +73,7 @@ def configure_site(cfg):
     networks. Examples use documentation addresses and are not real routes.
     """
     global UCG_EXPORTER, BGP_PEER, OWN_IPS, INTERNAL_NETWORKS
-    global BLOCKED_NETWORKS, ISPS, ISP_BY_NEXTHOP
+    global BLOCKED_NETWORKS, ISPS, ISP_BY_NEXTHOP, ISP_LABELS
     if not isinstance(cfg, dict):
         raise ValueError("site config must be a JSON object")
     def v4(value):
@@ -85,6 +97,19 @@ def configure_site(cfg):
     declared = cfg["isps"]
     if set(declared) != expected:
         raise ValueError("isps must have ISPA and ISPB keys")
+    raw_labels = cfg.get("isp_labels", {})
+    if not isinstance(raw_labels, dict) or not set(raw_labels) <= expected:
+        raise ValueError("isp_labels must be an object containing only ISPA/ISPB keys")
+    labels = {}
+    for name in ("ISPA", "ISPB"):
+        label = raw_labels.get(name, name)
+        if (not isinstance(label, str) or not 1 <= len(label) <= 24
+                or label != label.strip()
+                or any(ord(ch) < 32 or ord(ch) == 127 for ch in label)):
+            raise ValueError(f"isp_labels.{name} must be a printable 1–24 character name")
+        labels[name] = label
+    if labels["ISPA"].casefold() == labels["ISPB"].casefold():
+        raise ValueError("ISP display names must be different")
     providers = {}
     for name in ("ISPA", "ISPB"):
         item = declared[name]
@@ -105,6 +130,7 @@ def configure_site(cfg):
         net(x) for x in cfg.get("extra_blocked_networks", []))
     ISPS = providers
     ISP_BY_NEXTHOP = {v["next_hop"]: k for k, v in ISPS.items()}
+    ISP_LABELS = labels
 
 
 PREFIX_LENGTH = 24
@@ -292,7 +318,7 @@ def _write_public_list(path, data):
 
 
 def record_route_event(event, prefix, old_isp=None, new_isp=None, reason=""):
-    """Log actual accepted ExaBGP CLI actions, never hypothetical dry-run moves."""
+    """Log actual accepted BGP CLI actions, never hypothetical dry-run moves."""
     events = _load_public_list(ROUTE_EVENTS_FILE)
     events.insert(0, {
         "epoch": round(ts(), 3),
@@ -336,19 +362,37 @@ def record_quality_sample(rows, timestamp=None):
 
 
 def bgp_health():
-    """Read ExaBGP neighbor summary. Unknown is distinct from confirmed down."""
+    """Confirm rustbgpd peer state; unknown is not the same as healthy."""
     try:
-        p = command(["sudo", EXABGP_CLI, "show neighbor summary"], timeout=8)
-        output = ((p.stdout or "") + "\n" + (p.stderr or ""))[:4096]
+        p = command([RBGPD_CLI, "-s", RBGPD_SOCKET, "--json", "neighbor", BGP_PEER], timeout=8)
         if p.returncode != 0:
-            return {"status": "unknown", "detail": "ExaBGP CLI query failed"}
-        lines = [line.strip() for line in output.splitlines() if BGP_PEER in line]
-        if not lines:
-            return {"status": "unknown", "detail": "Neighbor not present in CLI summary"}
-        status = "established" if any(re.search(r"\bestablished\b", line, re.I) for line in lines) else "down"
-        return {"status": status, "detail": f"UCG peer {BGP_PEER}"}
+            return {"status": "unknown", "detail": "rustbgpd neighbor query failed"}
+        try:
+            peer = json.loads(p.stdout)
+        except (TypeError, ValueError):
+            return {"status": "unknown", "detail": "Invalid rustbgpd neighbor JSON"}
+        if not isinstance(peer, dict) or peer.get("address") != BGP_PEER:
+            return {"status": "unknown", "detail": "rustbgpd peer identity mismatch"}
+        state = str(peer.get("state", "")).lower()
+        if state == "established":
+            return {"status": "established", "detail": f"rustbgpd peer {BGP_PEER}"}
+        if state in {"idle", "connect", "active", "opensent", "openconfirm", "stale"}:
+            return {"status": "down", "detail": f"rustbgpd peer {BGP_PEER}: {state}"}
+        return {"status": "unknown", "detail": "rustbgpd neighbor state unavailable"}
     except (OSError, subprocess.TimeoutExpired):
-        return {"status": "unknown", "detail": "ExaBGP CLI unavailable"}
+        return {"status": "unknown", "detail": "rustbgpd CLI unavailable"}
+
+
+def validate_backend_state(state, apply):
+    """Never replay untagged/legacy routes with a different BGP daemon."""
+    if not apply or not state["routes"]:
+        return
+    existing = state.get("bgp_backend", "legacy")
+    if existing != "rustbgpd":
+        raise RuntimeError(
+            f"Persisted routes belong to {existing}, not rustbgpd. "
+            "Withdraw them with the original deployment and confirm on UniFi "
+            "before switching; do not delete state blindly.")
 
 
 def status_measurement(measurement):
@@ -613,14 +657,27 @@ def aggregate_measurements(row, individual):
 
 # --- BGP action helpers ------------------------------------------------------
 def bgp(action, prefix, isp, apply):
+    """Use only rustbgpd's owner-local socket; --apply is required for writes."""
     nh = ISPS[isp]["next_hop"]
-    statement = f"{action} route {prefix} next-hop {nh}"
     if not apply:
-        return True, f"DRY-RUN: {statement}"
-    proc = command(["sudo", EXABGP_CLI, statement], timeout=20)
+        return True, f"DRY-RUN (rustbgpd): {action} {prefix} next-hop {nh}"
+    if bgp_health()["status"] != "established":
+        return False, "rustbgpd peer not confirmed Established"
+    if action == "announce":
+        cmd = [RBGPD_CLI, "-s", RBGPD_SOCKET, "rib", "add", prefix,
+               "--next-hop", nh]
+    elif action == "withdraw":
+        cmd = [RBGPD_CLI, "-s", RBGPD_SOCKET, "rib", "delete", prefix]
+    else:
+        return False, f"unsupported BGP action {action}"
+    try:
+        proc = command(cmd, timeout=20)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return False, f"rustbgpd CLI error: {exc}"
     if proc.returncode != 0:
-        return False, (proc.stderr or proc.stdout).strip()
-    return True, (proc.stdout or "command accepted").strip()
+        return False, (proc.stderr or proc.stdout or "BGP CLI failed").strip()[:500]
+    # CLI success means local daemon acceptance, not gateway FIB confirmation.
+    return True, (proc.stdout or "command accepted locally").strip()[:500]
 
 
 def announce(prefix, isp, state, apply, limit, reason):
@@ -636,6 +693,7 @@ def announce(prefix, isp, state, apply, limit, reason):
     if ok and apply:
         routes[prefix] = {"isp": isp, "next_hop": ISPS[isp]["next_hop"],
                           "changed_at": ts(), "reason": reason}
+        state["bgp_backend"] = "rustbgpd"
         save_state(state, ACTIVE_STATE_PATH)
         try:
             record_route_event("move" if old else "announce", prefix,
@@ -663,6 +721,7 @@ def withdraw(prefix, state, apply, reason="unspecified withdrawal"):
 def reconcile_routes(state, apply):
     if not apply:
         return
+    validate_backend_state(state, apply)
     for prefix, route in sorted(state["routes"].items()):
         if eligible_prefix(prefix.split("/")[0]) != prefix or route.get("isp") not in ISPS:
             raise RuntimeError(f"Invalid persisted route {prefix}; aborting")
@@ -842,12 +901,13 @@ def cycle(state, args):
     records = collect_flows(state, monitored_flows())
     rows = candidates(state, records, args.top)
     probes = probe_all(rows) if rows else {}
-    print(f"\nRoute Optimizer v3.3 [{'APPLY' if args.apply else 'DRY-RUN'}] "
+    print(f"\nRoute Optimizer v3.4 [{BGP_BACKEND} {'APPLY' if args.apply else 'DRY-RUN'}] "
           f"{datetime.now().isoformat(timespec='seconds')}", flush=True)
     print(f"Prefix /{PREFIX_LENGTH} | top {args.top} | win {WIN_STREAK_REQUIRED} | "
           f"quiet {QUIET_SECONDS}s | hold {HOLD_DOWN}s | "
           f"routes {len(state['routes'])}/{args.max_routes}")
-    print(f"{'Prefix':<19} {'MiB':>8} {'Hosts':>5} {'Observed':<9} {'Route':<9} {'ISPA':>20} {'ISPB':>20}  Action")
+    print(f"{'Prefix':<19} {'MiB':>8} {'Hosts':>5} {'Observed':<9} {'Route':<9} "
+          f"{ISP_LABELS['ISPA']:>20} {ISP_LABELS['ISPB']:>20}  Action")
     print("-" * 149)
     handled = set()
     dashboard_rows = []
@@ -868,9 +928,9 @@ def cycle(state, args):
                 action = f"{'WITHDRAW' if args.apply else 'WOULD WITHDRAW'} inactive" if ok else f"WITHDRAW FAILED: {msg}"
         installed = state["routes"].get(prefix, {}).get("isp", "-")
         print(f"{prefix:<19} {row['bytes']/1048576:8.2f} {len(row['hosts']):5d} "
-              f"{str(row['current'] or '-'):9.9} {installed:9.9} "
+              f"{display_isp(row['current'] or '-'):9.9} {display_isp(installed):9.9} "
               f"{fmt_probe(measurements.get('ISPA') if measurements else None):>20} "
-              f"{fmt_probe(measurements.get('ISPB') if measurements else None):>20}  {action}", flush=True)
+              f"{fmt_probe(measurements.get('ISPB') if measurements else None):>20}  {display_isp(action)}", flush=True)
         dashboard_rows.append({
             "prefix": prefix, "mib": round(row["bytes"] / 1048576, 3),
             "hosts": len(row["hosts"]), "representatives": [h["ip"] for h in row["hosts"]],
@@ -881,7 +941,7 @@ def cycle(state, args):
         })
     sweep_messages = expiry_sweep(state, records, handled, args.apply)
     for msg in sweep_messages:
-        print(msg, flush=True)
+        print(display_isp(msg), flush=True)
     for prefix, ds in list(state["destinations"].items()):
         if prefix not in state["routes"] and not ds.get("pending") and ts() - float(ds.get("updated", 0)) > STATE_GC:
             del state["destinations"][prefix]
@@ -899,12 +959,14 @@ def cycle(state, args):
     except Exception as exc:
         print(f"WARNING quality history write failed: {exc}", file=sys.stderr)
     snapshot = {
-        "version": "3.3", "epoch": cycle_epoch,
+        "version": "3.4", "epoch": cycle_epoch,
+        "isp_labels": ISP_LABELS.copy(),
         "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
         "mode": "APPLY" if args.apply else "DRY-RUN", "error": None,
         "cycle_seconds": round(time.monotonic() - started, 2),
         "config": {"prefix_length": PREFIX_LENGTH, "top": args.top,
-                   "max_routes": args.max_routes, "traffic_window": TRAFFIC_WINDOW,
+                   "max_routes": args.max_routes, "bgp_backend": BGP_BACKEND,
+                   "traffic_window": TRAFFIC_WINDOW,
                    "min_bytes": MIN_BYTES, "quiet_seconds": QUIET_SECONDS,
                    "single_host_quiet_seconds": SINGLE_HOST_QUIET_SECONDS},
         "route_count": len(state["routes"]),
@@ -927,10 +989,16 @@ def cycle(state, args):
 
 
 def main():
+    global ACTIVE_STATE_PATH, BGP_BACKEND, RBGPD_CLI, RBGPD_SOCKET
     parser = argparse.ArgumentParser(description="Dual-WAN /24 route optimizer (dry-run by default)")
     parser.add_argument("--config", type=Path, default=Path("/etc/route-optimizer/config.json"),
                         help="site-specific JSON config (required)")
-    parser.add_argument("--apply", action="store_true", help="enable actual ExaBGP actions")
+    parser.add_argument("--apply", action="store_true", help="enable actual BGP route changes")
+    # Compatibility with deployed v3.4 units; rustbgpd is now the only backend.
+    parser.add_argument("--bgp-backend", choices=("rustbgpd",), default="rustbgpd",
+                        help=argparse.SUPPRESS)
+    parser.add_argument("--rbgp-cli", default=RBGPD_CLI, help="path to rustbgpd rbgp CLI")
+    parser.add_argument("--rbgp-socket", default=RBGPD_SOCKET, help="local rustbgpd gRPC UDS URI")
     parser.add_argument("--watch", metavar="SECONDS", type=int, default=0, help="repeat every N seconds")
     parser.add_argument("--top", type=int, default=DEFAULT_TOP)
     parser.add_argument("--max-routes", type=int, default=DEFAULT_ROUTE_LIMIT)
@@ -941,8 +1009,12 @@ def main():
         configure_site(json.loads(args.config.read_text(encoding="utf-8")))
     except (OSError, ValueError, KeyError, TypeError) as exc:
         parser.error(f"invalid --config {args.config}: {exc} (copy examples/config.example.json)")
-    global ACTIVE_STATE_PATH
     ACTIVE_STATE_PATH = args.state
+    BGP_BACKEND = args.bgp_backend
+    RBGPD_CLI = args.rbgp_cli
+    RBGPD_SOCKET = args.rbgp_socket
+    if not RBGPD_SOCKET.startswith("unix:///"):
+        parser.error("rustbgpd requires a local unix:/// gRPC socket (no network listener)")
     if not (1 <= args.max_routes <= HARD_MAX_ROUTES):
         parser.error(f"--max-routes must be between 1 and {HARD_MAX_ROUTES}")
     if args.top < 1 or args.watch < 0:
@@ -955,6 +1027,7 @@ def main():
             parser.error("another route-optimizer-v3 process is already running")
         try:
             state = load_state(args.state)
+            validate_backend_state(state, args.apply)
             if len(state["routes"]) > args.max_routes and not args.withdraw_all:
                 raise RuntimeError("state already exceeds --max-routes; raise limit or withdraw")
             if args.withdraw_all:
@@ -967,8 +1040,16 @@ def main():
                 save_state(state, args.state)
                 return 1 if failures else 0
             reconcile_routes(state, args.apply)
+            last_reconcile = time.monotonic()
             while True:
                 start = time.monotonic()
+                # rustbgpd local injected routes can disappear after its restart.
+                # Re-announce the small, tracked route set periodically in live
+                # mode, without altering hold-downs or generating move events.
+                if (args.apply and state["routes"]
+                        and start - last_reconcile >= RBGPD_RECONCILE_SECONDS):
+                    reconcile_routes(state, True)
+                    last_reconcile = time.monotonic()
                 cycle(state, args)
                 if not args.watch:
                     return 0
@@ -980,7 +1061,8 @@ def main():
             print(f"ERROR: {exc}", file=sys.stderr)
             try:
                 write_status({
-                    "version": "3.3", "epoch": ts(),
+                    "version": "3.4", "epoch": ts(),
+                    "isp_labels": ISP_LABELS.copy(),
                     "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
                     "mode": "APPLY" if args.apply else "DRY-RUN", "error": str(exc),
                     "cycle_seconds": None,

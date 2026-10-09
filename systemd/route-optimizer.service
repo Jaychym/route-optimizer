@@ -1,7 +1,7 @@
 [Unit]
-Description=Route Optimizer v3.3 - dual-WAN BGP optimizer
-Wants=network-online.target nfdump@default.service exabgp.service
-After=network-online.target nfdump@default.service exabgp.service
+Description=Route Optimizer v3.4 - rustbgpd dual-WAN optimizer (DRY-RUN)
+Wants=network-online.target nfdump@default.service rustbgpd.service
+After=network-online.target nfdump@default.service rustbgpd.service
 RequiresMountsFor=/var/cache/nfdump /var/lib/route-optimizer
 StartLimitIntervalSec=300
 StartLimitBurst=5
@@ -12,8 +12,8 @@ User=root
 Group=root
 WorkingDirectory=/opt/route-optimizer
 Environment=PYTHONUNBUFFERED=1
-# DRY RUN by default. Add --apply only after reviewing output and UCG BGP limits.
-ExecStart=/usr/bin/python3 -u /opt/route-optimizer/route-optimizer.py --watch 60 --top 50 --max-routes 50
+# Safe default: no --apply; never enable changes without explicit review.
+ExecStart=/usr/bin/python3 -u /opt/route-optimizer/route-optimizer.py --config /etc/route-optimizer/config.json --watch 60 --top 50 --max-routes 50
 Restart=on-failure
 RestartSec=15
 TimeoutStopSec=20

@@ -21,3 +21,13 @@ iface ens20 inet static
     post-up ip route replace default via 10.250.2.1 dev ens20 table 252
     post-up ip rule add from 10.250.2.2/32 table 252 priority 1252 || true
     pre-down ip rule del from 10.250.2.2/32 table 252 priority 1252 || true
+# IMPORTANT (UniFi gateway): source/iif rules for both probe VLANs also
+# need to run BEFORE the gateway's 'from all lookup main' rule.
+# BGP-injected /24 routes in the main table can otherwise redirect both
+# probe sources over the same WAN and invalidate measurements.
+# Conceptual gateway rules (adapt actual priority, tables and interfaces):
+#   from <PROBE_A_SOURCE_IP> iif <PROBE_A_VLAN> lookup <WAN_A_TABLE>
+#   from <PROBE_B_SOURCE_IP> iif <PROBE_B_VLAN> lookup <WAN_B_TABLE>
+# Verify on the gateway with 'ip route get ... from ... iif ...' and
+# physical WAN tcpdump while an eligible test BGP /24 is installed.
+# Ensure persistence over reboot/config reload and fail-closed behavior.
