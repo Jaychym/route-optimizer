@@ -42,6 +42,8 @@ flowchart TB
 
 ## Installation (new deployment)
 
+**New to rustbgpd?** Follow the step-by-step **[rustbgpd installation and UniFi peering guide](docs/rustbgpd-setup.md)** first. It covers a pinned, checksum-verified release install, service setup, strict TOML validation, peering, and gateway/probe forwarding verification. For upgrades from an older BGP daemon, see [the migration guide](docs/rustbgpd-migration.md).
+
 1. Set up a **static management address** on the Debian VM, two probe VLAN interfaces, their source-routing rules and UniFi VLAN→WAN policy routes. Start from [`examples/network-interfaces.example`](examples/network-interfaces.example), adapting the interface names and topology. Check `ip rule` and both policy tables after reboot.
 2. Configure UniFi IPFIX v10 to export your production LAN/VLAN flows to the VM UDP 2055. Exclude the probe VLANs if possible to avoid feedback. Confirm `tcpdump -ni <management-interface> udp port 2055` receives packets.
 3. Install a **pinned rustbgpd** release following the [upstream deployment guide](https://github.com/lance0/rustbgpd/blob/main/docs/how-to/deployment.md), customize [`examples/rustbgpd.toml.example`](examples/rustbgpd.toml.example) and validate with `sudo rustbgpd --check --strict /etc/rustbgpd/config.toml`. Install its upstream systemd service, start it, then verify `sudo rbgp summary` reports the UniFi neighbor **Established**. Do not run another BGP speaker against the same peer.
