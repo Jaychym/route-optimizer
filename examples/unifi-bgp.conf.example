@@ -49,7 +49,7 @@ ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 41 deny 240.0.0.0/4 le 32
 ! Add any additional site-specific connected/public infrastructure prefixes
 ! and other excluded routes before the seq 100 permit.
 !
-ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 100 permit 0.0.0.0/0 ge 24 le 32
+ip prefix-list ROUTE_OPTIMIZER_ALLOWED seq 100 permit 0.0.0.0/0 ge 24 le 24
 !
 route-map ROUTE_OPTIMIZER_IN permit 10
  match ip address prefix-list ROUTE_OPTIMIZER_ALLOWED
